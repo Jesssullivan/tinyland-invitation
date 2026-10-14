@@ -5,7 +5,10 @@
 Reconciles the reviewed `candidate/nonprod-20260924-170b52743ef9` lineage (the
 invitation source the Mothership writer image already builds through
 `--override_module`) onto 0.3.0, so consumers can resolve it from the registry
-(TIN-3692 RU11). Additive for 0.3.0 consumers.
+(TIN-3692 RU11). There is no dependency, peer, engine or export change, but
+it is not a drop-in update for legacy (non-durable) acceptance: that path now
+needs a consumer hook, an existing user file and canonical handles. See
+[Migrating from 0.3.0](#migrating-from-030).
 
 - `InvitationConfig.durableAcceptance` (optional, single-process, file-native
   acceptance journal), `InvitationService.recoverPendingAcceptances()` and
@@ -22,10 +25,16 @@ invitation source the Mothership writer image already builds through
   fails closed. It is never read as an empty list, so no acceptance can rewrite
   `admin-users.json` without the established accounts. Legacy mode re-reads the
   users after hashing and writes only from that successful read.
+- Both modes accept only canonical handles (already trimmed and lowercase,
+  `^[a-z0-9][a-z0-9_-]*$`). Legacy mode refuses any other handle with
+  `Invalid handle` before any read, hook call, claim or write. It reserves
+  existing handles and username aliases case-insensitively before the claim
+  and again after hashing, and refuses a generated user id that already exists.
+  So neither mode writes a user file that its own strict reader rejects.
 - Inactive invitations are excluded from pending lookup, acceptance and the
   pending list (both modes).
-- Durable mode also reserves legacy username aliases. Committed issuance is
-  reported truthfully even if the audit sink fails (both modes).
+- Both modes reserve legacy username aliases. Committed issuance is reported
+  truthfully even if the audit sink fails (both modes).
 - The new acceptance and expiry paths read the internal `seams.ts` clock that
   0.3.0 introduced (system time unless the NODE_ENV=test testing build installs
   a clock); no public clock option is added.
@@ -53,7 +62,17 @@ that consumers must act on:
    fails the acceptance and is left untouched.
 3. **Inactive invitations** (`isActive !== true`) are no longer returned by
    `getInvitation` or `listPendingInvitations`, and cannot be accepted.
-4. **Rollback is not state-safe after durable writes.** Before moving back to
+4. **Handles must be canonical.** Legacy acceptance used to write any handle
+   verbatim. It now refuses empty, padded, uppercase or otherwise
+   non-canonical handles with `{ success: false, error: 'Invalid handle' }`
+   and leaves the token pending, so lowercase and trim input in your form or
+   show that error. Usernames and handles already in the file are now
+   reserved case-insensitively.
+5. **Repair an existing user file first.** A file written by 0.3.0 can
+   already hold an empty handle, two handles that differ only by case or
+   spacing, or a duplicate id. 0.4.0 treats it as corrupt and every
+   acceptance fails until it is repaired by hand. Check it before upgrading.
+6. **Rollback is not state-safe after durable writes.** Before moving back to
    0.3.0, finish recovery and keep the acceptance journal (see the README).
 
 ## 0.2.6 — unreleased launch candidate (folded into 0.4.0)

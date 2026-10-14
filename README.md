@@ -106,6 +106,13 @@ canAcceptInvitation: async ({ invitation, handle }) =>
   corrupt file fails the acceptance and is never rewritten. Seed it with `[]`
   or the bootstrap account first. The new user is appended to a fresh,
   successful read taken after hashing.
+- Handles follow the durable rule: already trimmed and lowercase and matching
+  `^[a-z0-9][a-z0-9_-]*$`. Any other handle (including empty, `ROOT` or
+  ` root`) is refused with `Invalid handle` before any read, hook call, claim
+  or write. An existing handle or retained username alias is reserved
+  case-insensitively, both before the claim and after hashing, and a generated
+  user id that already exists is refused. Acceptance therefore never writes a
+  user file that its own strict reader would reject.
 
 ## Validation
 

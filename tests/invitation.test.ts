@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { configure, getConfig, resetConfig } from '../src/config.js';
 import { InvitationService } from '../src/service.js';
+import { parseUserProjection } from '../src/durable-acceptance.js';
 import { InvitationError } from '../src/index.js';
 import type {
   InvitationConfig,
@@ -1114,6 +1115,103 @@ describe('tinyland-invitation', () => {
       expect(mocks.canAcceptInvitation).toHaveBeenCalledTimes(2);
       expect(userWrites()).toHaveLength(1);
       expect(userIds()).toEqual(['u-super', 'u-admin', 'test-id-123']);
+    });
+
+    // The writer must never produce a projection the strict reader rejects:
+    // one bad handle would otherwise block every later legacy acceptance.
+    it.each([
+      ['ROOT'], ['Root'], [' root'], ['root '], [''], ['Admin-Handle'], ['Invitee'],
+      ['in vitee'], ['-lead'], ['a.b'], [undefined], [42],
+    ])('refuses the non-canonical handle %j before any read, hook, claim or write', async (handle) => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.readFile.mockClear();
+
+      const result = await service.acceptInvitation({
+        token, handle: handle as string, password: 'pass',
+      });
+
+      expect(result).toEqual({ success: false, error: 'Invalid handle' });
+      expect(mocks.readFile).not.toHaveBeenCalled();
+      expect(mocks.canAcceptInvitation).not.toHaveBeenCalled();
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+
+      // The users file stays readable, so a later clean acceptance still works.
+      const clean = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+      expect(clean.success).toBe(true);
+      expect(userIds()).toEqual(['u-super', 'u-admin', 'test-id-123']);
+      expect(() => parseUserProjection(files.get(USERS)!)).not.toThrow();
+    });
+
+    it('reserves a stored handle case-insensitively and leaves the token pending', async () => {
+      const legacyCase: AdminUser = {
+        ...established[1], id: 'u-ops', username: 'Ops', handle: 'Ops',
+      };
+      files.set(USERS, JSON.stringify([...established, legacyCase]));
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+
+      const result = await service.acceptInvitation({ token, handle: 'ops', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Handle already taken' });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+
+    it('reserves a retained username alias before the claim', async () => {
+      const renamed: AdminUser = {
+        ...established[1], id: 'u-carol', username: 'carol-old', handle: 'carol',
+      };
+      files.set(USERS, JSON.stringify([...established, renamed]));
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+
+      const result = await service.acceptInvitation({ token, handle: 'carol-old', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Handle already taken' });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+
+    it('reserves a username alias that appears while the password is hashed', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      const racer: AdminUser = {
+        ...established[1], id: 'u-racer', username: 'late-alias', handle: 'racer',
+      };
+      mocks.hashPassword.mockImplementationOnce(async (pw: string) => {
+        files.set(USERS, JSON.stringify([...established, racer]));
+        return `hashed:${pw}`;
+      });
+
+      const result = await service.acceptInvitation({ token, handle: 'late-alias', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Handle already taken' });
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin', 'u-racer']);
+      expect(await service.getInvitation(token)).toBeNull();
+    });
+
+    it('refuses a generated user id that collides with an existing account before the claim', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.generateId.mockReturnValueOnce('u-super');
+
+      const result = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
     });
   });
 
