@@ -3,7 +3,7 @@ import { getConfig } from './config.js';
 import { InvitationError } from './errors.js';
 import { defaultCanCreateInviteForRole } from './roles.js';
 import { currentDate } from './seams.js';
-import { DurableInvitationAcceptance, parseUserProjection } from './durable-acceptance.js';
+import { DurableInvitationAcceptance, canonicalAcceptanceHandle, parseUserProjection, userReservesHandle, } from './durable-acceptance.js';
 const acceptanceLocks = new Map();
 const failedAcceptanceClaims = new Set();
 // Bounds each issuance or extension request, not the cumulative invite lifetime.
@@ -213,6 +213,13 @@ export class InvitationService {
             console.error('Invitation acceptance refused: configure canAcceptInvitation (or durableAcceptance)');
             return { success: false, error: 'Failed to accept invitation' };
         }
+        // The same canonical handle rule as durable mode, checked before any read,
+        // hook call, claim or write. The strict user reader rejects empty handles
+        // and case-insensitive duplicates, so accepting a non-canonical handle here
+        // would write a projection that blocks every later acceptance.
+        if (!canonicalAcceptanceHandle(data.handle)) {
+            return { success: false, error: 'Invalid handle' };
+        }
         const lockKey = `${config.invitesFilePath}\0${data.token}`;
         return withAcceptanceLock(lockKey, async () => {
             await this.ensureInitialized();
@@ -241,13 +248,18 @@ export class InvitationService {
                         error: 'Invalid or expired invitation',
                     };
                 }
-                if (existingUsers.some((u) => u.handle === data.handle)) {
+                if (existingUsers.some((u) => userReservesHandle(u, data.handle))) {
                     return {
                         success: false,
                         error: 'Handle already taken',
                     };
                 }
+                // A missing or colliding id would also write a projection the strict
+                // reader rejects, so refuse before the claim.
                 const userId = config.generateId();
+                if (!userId || existingUsers.some((u) => u.id === userId)) {
+                    return { success: false, error: 'Failed to accept invitation' };
+                }
                 // Claim first. Once validation succeeds, any later hash, user-file, or
                 // audit failure leaves the token consumed instead of reopening a
                 // role-bearing capability. If persistence itself fails, retain a
@@ -274,11 +286,14 @@ export class InvitationService {
                         error: 'Invalid or expired invitation',
                     };
                 }
-                if (currentUsers.some((u) => u.handle === data.handle)) {
+                if (currentUsers.some((u) => userReservesHandle(u, data.handle))) {
                     return {
                         success: false,
                         error: 'Handle already taken',
                     };
+                }
+                if (currentUsers.some((u) => u.id === userId)) {
+                    return { success: false, error: 'Failed to accept invitation' };
                 }
                 const newUser = {
                     id: userId,

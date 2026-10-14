@@ -1,6 +1,16 @@
 import type { InvitationConfig } from './config.js';
 import type { AcceptResult, AdminInvite, AdminUser, InvitationAcceptData } from './types.js';
 /**
+ * The canonical handle rule for acceptance in both modes (internal, not
+ * exported from the package entry). A handle must already be trimmed and
+ * lowercase and match `^[a-z0-9][a-z0-9_-]*$`, so no acceptance can write a
+ * user that `parseUserProjection` would later reject as invalid or as a
+ * case-insensitive duplicate.
+ */
+export declare function canonicalAcceptanceHandle(handle: unknown): handle is string;
+/** `handle` must already satisfy `canonicalAcceptanceHandle`. */
+export declare function userReservesHandle(user: AdminUser, handle: string): boolean;
+/**
  * Strictly parse the user authority. A read or parse failure is never mapped to
  * an empty list: writing from that list would erase every existing account.
  * Shared by the durable and legacy acceptance paths (internal, not exported

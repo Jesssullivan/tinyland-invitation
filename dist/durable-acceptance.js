@@ -11,7 +11,20 @@ function tokenHash(token) {
 function normalizedHandle(handle) {
     return handle.trim().toLowerCase();
 }
-function userReservesHandle(user, handle) {
+/**
+ * The canonical handle rule for acceptance in both modes (internal, not
+ * exported from the package entry). A handle must already be trimmed and
+ * lowercase and match `^[a-z0-9][a-z0-9_-]*$`, so no acceptance can write a
+ * user that `parseUserProjection` would later reject as invalid or as a
+ * case-insensitive duplicate.
+ */
+export function canonicalAcceptanceHandle(handle) {
+    return typeof handle === 'string' && handle !== ''
+        && normalizedHandle(handle) === handle
+        && /^[a-z0-9][a-z0-9_-]*$/.test(handle);
+}
+/** `handle` must already satisfy `canonicalAcceptanceHandle`. */
+export function userReservesHandle(user, handle) {
     // Login resolves both the canonical handle and the retained username alias.
     // Reserve either identity, including inactive/tombstoned accounts. The
     // normalized comparison is conservative for legacy case/spacing variants;
@@ -74,9 +87,7 @@ export class DurableInvitationAcceptance {
     }
     async accept(data) {
         return this.withReadyState(async () => {
-            if (!data.token || !data.password || !data.handle
-                || normalizedHandle(data.handle) !== data.handle
-                || !/^[a-z0-9][a-z0-9_-]*$/.test(data.handle))
+            if (!data.token || !data.password || !canonicalAcceptanceHandle(data.handle))
                 return invalid();
             const journal = await this.readJournal();
             const digest = tokenHash(data.token);
