@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { configure, getConfig, resetConfig } from '../src/config.js';
 import { InvitationService } from '../src/service.js';
+import { parseUserProjection } from '../src/durable-acceptance.js';
 import { InvitationError } from '../src/index.js';
 import type {
   InvitationConfig,
@@ -30,6 +31,9 @@ function createMocks() {
     ),
     generateQrCode: vi.fn(async () => 'data:image/png;base64,qrcode'),
     auditLog: vi.fn<(eventType: string, data: Record<string, unknown>) => Promise<void>>().mockResolvedValue(undefined),
+    // Legacy acceptance requires a consumer gate; fixtures allow by default.
+    canAcceptInvitation: vi.fn<(args: { invitation: AdminInvite; handle: string }) => Promise<boolean>>()
+      .mockResolvedValue(true),
   };
 }
 
@@ -52,11 +56,14 @@ function buildConfig(mocks: Mocks): InvitationConfig {
     },
     auditLog: mocks.auditLog,
     publicUrl: 'http://localhost:9080',
+    canAcceptInvitation: mocks.canAcceptInvitation,
   };
 }
 
+// The user authority exists (explicitly empty) unless a test removes it: a
+// missing or corrupt user file must fail closed, never read as [].
 function installStatefulStorage(mocks: Mocks): Map<string, string> {
-  const files = new Map<string, string>();
+  const files = new Map<string, string>([['/tmp/admin-users.json', '[]']]);
   mocks.readFile.mockImplementation(async (path: string) => {
     const data = files.get(path);
     if (data === undefined) {
@@ -361,6 +368,19 @@ describe('tinyland-invitation', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Failed to create invitation');
+      expect(mocks.writeFile).not.toHaveBeenCalled();
+      expect(mocks.auditLog).not.toHaveBeenCalled();
+    });
+
+    it('returns the committed invitation if audit delivery fails after the save', async () => {
+      mocks.auditLog.mockRejectedValueOnce(new Error('audit sink offline'));
+      const service = new InvitationService();
+      const result = await service.createInvitation(defaultCreateOptions);
+
+      expect(result.success).toBe(true);
+      expect(result.inviteUrl).toContain(result.invitation!.token);
+      expect(mocks.writeFile).toHaveBeenCalledOnce();
+      expect(await service.getInvitation(result.invitation!.token)).toEqual(result.invitation);
     });
 
     it('uses createdBy as createdByHandle when createdByHandle is empty', async () => {
@@ -373,20 +393,17 @@ describe('tinyland-invitation', () => {
       expect(result.invitation!.createdByHandle).toBe('admin-1');
     });
 
-    it('sets expiresInHours to 0 when explicitly passed as 0 (uses config default)', async () => {
+    it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 169])
+    ('rejects unsupported expiry %s before minting or saving a token', async (expiresInHours) => {
       const service = new InvitationService();
       const result = await service.createInvitation({
         ...defaultCreateOptions,
-        expiresInHours: 0,
+        expiresInHours,
       });
 
-      
-      
-      const expiresAt = new Date(result.invitation!.expiresAt);
-      const now = new Date();
-      const hoursFromNow = (expiresAt.getTime() - now.getTime()) / (1000 * 60 * 60);
-      
-      expect(hoursFromNow).toBeLessThan(1);
+      expect(result).toEqual({ success: false, error: 'Invalid invitation expiry' });
+      expect(mocks.generateId).not.toHaveBeenCalled();
+      expect(mocks.writeFile).not.toHaveBeenCalled();
     });
 
     it('generates unique tokens for multiple invitations', async () => {
@@ -895,7 +912,7 @@ describe('tinyland-invitation', () => {
       expect(persistedInvites).toHaveLength(1);
       expect(persistedInvites[0].usedAt).toEqual(expect.any(String));
       expect(persistedInvites[0].usedBy).toEqual(expect.any(String));
-      expect(files.has('/tmp/admin-users.json')).toBe(false);
+      expect(files.get('/tmp/admin-users.json')).toBe('[]');
     });
 
     it('fails closed in-process when the token claim cannot be persisted', async () => {
@@ -925,13 +942,278 @@ describe('tinyland-invitation', () => {
         error: 'Invalid or expired invitation',
       });
       expect(mocks.hashPassword).not.toHaveBeenCalled();
-      expect(files.has('/tmp/admin-users.json')).toBe(false);
+      expect(files.get('/tmp/admin-users.json')).toBe('[]');
     });
   });
 
   
   
   
+
+  describe('legacy acceptance gate (no direct user write without the consumer hook)', () => {
+    const USERS = '/tmp/admin-users.json';
+    const established: AdminUser[] = [
+      {
+        id: 'u-super', username: 'root', handle: 'root', email: '', passwordHash: 'h1',
+        role: 'super_admin', totpEnabled: true, isActive: true,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+      {
+        id: 'u-admin', username: 'admin-handle', handle: 'admin-handle', email: '', passwordHash: 'h2',
+        role: 'admin', totpEnabled: true, isActive: true,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+    ];
+    let files: Map<string, string>;
+
+    beforeEach(() => {
+      files = installStatefulStorage(mocks);
+      files.set(USERS, JSON.stringify(established));
+    });
+
+    const userWrites = () => mocks.writeFile.mock.calls.filter(([path]) => path === USERS);
+    const userIds = () => (JSON.parse(files.get(USERS)!) as AdminUser[]).map((user) => user.id);
+
+    function failUsersRead(onRead: number) {
+      const stateful = mocks.readFile.getMockImplementation()!;
+      let reads = 0;
+      mocks.readFile.mockImplementation(async (path: string) => {
+        if (path === USERS && ++reads === onRead) {
+          throw Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' });
+        }
+        return stateful(path);
+      });
+    }
+
+    it('refuses legacy acceptance when no canAcceptInvitation hook is configured', async () => {
+      configure({ ...buildConfig(mocks), canAcceptInvitation: undefined });
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.readFile.mockClear();
+
+      const result = await service.acceptInvitation({ token, handle: 'nohook', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(mocks.readFile).not.toHaveBeenCalledWith(USERS);
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin']);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+
+    it('asks the hook with the invitation and handle; a denial claims nothing and writes nothing', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.canAcceptInvitation.mockResolvedValue(false);
+
+      const result = await service.acceptInvitation({ token, handle: 'denied', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Invalid or expired invitation' });
+      expect(mocks.canAcceptInvitation).toHaveBeenCalledWith({
+        invitation: expect.objectContaining({ id: created.invitation!.id, token, role: 'editor' }),
+        handle: 'denied',
+      });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin']);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+
+    it('re-asks the hook after hashing; a late denial keeps the token consumed and writes no user', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.canAcceptInvitation.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+
+      const result = await service.acceptInvitation({ token, handle: 'late', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Invalid or expired invitation' });
+      expect(mocks.canAcceptInvitation).toHaveBeenCalledTimes(2);
+      expect(mocks.canAcceptInvitation.mock.calls[1][0].invitation.usedAt).toBeUndefined();
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin']);
+      expect(await service.getInvitation(token)).toBeNull();
+    });
+
+    it('treats a throwing hook as a failure with no user write', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      mocks.canAcceptInvitation.mockRejectedValue(new Error('creator lookup failed'));
+
+      const result = await service.acceptInvitation({
+        token: created.invitation!.token, handle: 'throws', password: 'pass',
+      });
+
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin']);
+    });
+
+    it('a transient EIO on the users read never erases established accounts (F1 probe)', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      failUsersRead(1);
+
+      const failed = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+
+      expect(failed).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin']);
+
+      // Nothing was claimed, so a retry on healthy storage appends the invitee.
+      const retried = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+      expect(retried.success).toBe(true);
+      expect(userIds()).toEqual(['u-super', 'u-admin', 'test-id-123']);
+    });
+
+    it('a users read failure after hashing keeps the token consumed and the users file intact', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      failUsersRead(2);
+
+      const result = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(mocks.hashPassword).toHaveBeenCalledTimes(1);
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin']);
+      expect(await service.getInvitation(token)).toBeNull();
+    });
+
+    it.each([
+      ['an object instead of an array', JSON.stringify({ users: established })],
+      ['an entry without an id', JSON.stringify([{ handle: 'root' }])],
+      ['duplicate ids', JSON.stringify([established[0], { ...established[1], id: 'u-super' }])],
+      ['an empty file', ''],
+    ])('fails closed on a users file with %s', async (_label, content) => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      files.set(USERS, content);
+
+      const result = await service.acceptInvitation({
+        token: created.invitation!.token, handle: 'invitee', password: 'pass',
+      });
+
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(userWrites()).toHaveLength(0);
+      expect(files.get(USERS)).toBe(content);
+    });
+
+    it('appends the invitee and preserves every established account on success', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+
+      const result = await service.acceptInvitation({
+        token: created.invitation!.token, handle: 'invitee', password: 'pass',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mocks.canAcceptInvitation).toHaveBeenCalledTimes(2);
+      expect(userWrites()).toHaveLength(1);
+      expect(userIds()).toEqual(['u-super', 'u-admin', 'test-id-123']);
+    });
+
+    // The writer must never produce a projection the strict reader rejects:
+    // one bad handle would otherwise block every later legacy acceptance.
+    it.each([
+      ['ROOT'], ['Root'], [' root'], ['root '], [''], ['Admin-Handle'], ['Invitee'],
+      ['in vitee'], ['-lead'], ['a.b'], [undefined], [42],
+    ])('refuses the non-canonical handle %j before any read, hook, claim or write', async (handle) => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.readFile.mockClear();
+
+      const result = await service.acceptInvitation({
+        token, handle: handle as string, password: 'pass',
+      });
+
+      expect(result).toEqual({ success: false, error: 'Invalid handle' });
+      expect(mocks.readFile).not.toHaveBeenCalled();
+      expect(mocks.canAcceptInvitation).not.toHaveBeenCalled();
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+
+      // The users file stays readable, so a later clean acceptance still works.
+      const clean = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+      expect(clean.success).toBe(true);
+      expect(userIds()).toEqual(['u-super', 'u-admin', 'test-id-123']);
+      expect(() => parseUserProjection(files.get(USERS)!)).not.toThrow();
+    });
+
+    it('reserves a stored handle case-insensitively and leaves the token pending', async () => {
+      const legacyCase: AdminUser = {
+        ...established[1], id: 'u-ops', username: 'Ops', handle: 'Ops',
+      };
+      files.set(USERS, JSON.stringify([...established, legacyCase]));
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+
+      const result = await service.acceptInvitation({ token, handle: 'ops', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Handle already taken' });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+
+    it('reserves a retained username alias before the claim', async () => {
+      const renamed: AdminUser = {
+        ...established[1], id: 'u-carol', username: 'carol-old', handle: 'carol',
+      };
+      files.set(USERS, JSON.stringify([...established, renamed]));
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+
+      const result = await service.acceptInvitation({ token, handle: 'carol-old', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Handle already taken' });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+
+    it('reserves a username alias that appears while the password is hashed', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      const racer: AdminUser = {
+        ...established[1], id: 'u-racer', username: 'late-alias', handle: 'racer',
+      };
+      mocks.hashPassword.mockImplementationOnce(async (pw: string) => {
+        files.set(USERS, JSON.stringify([...established, racer]));
+        return `hashed:${pw}`;
+      });
+
+      const result = await service.acceptInvitation({ token, handle: 'late-alias', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Handle already taken' });
+      expect(userWrites()).toHaveLength(0);
+      expect(userIds()).toEqual(['u-super', 'u-admin', 'u-racer']);
+      expect(await service.getInvitation(token)).toBeNull();
+    });
+
+    it('refuses a generated user id that collides with an existing account before the claim', async () => {
+      const service = new InvitationService();
+      const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
+      mocks.generateId.mockReturnValueOnce('u-super');
+
+      const result = await service.acceptInvitation({ token, handle: 'invitee', password: 'pass' });
+
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(userWrites()).toHaveLength(0);
+      expect(await service.getInvitation(token)).not.toBeNull();
+    });
+  });
 
   describe('listPendingInvitations', () => {
     it('returns only active, non-expired, non-used invitations', async () => {
@@ -1041,6 +1323,19 @@ describe('tinyland-invitation', () => {
       });
     });
 
+    it('reports a persisted revocation as successful even if audit delivery fails', async () => {
+      const invite = makeInvite({ token: 'revoked-without-audit' });
+      mocks.readFile.mockImplementation(async (path: string) => {
+        if (path === '/tmp/invites.json') return JSON.stringify([invite]);
+        throw new Error('not found');
+      });
+      mocks.auditLog.mockRejectedValueOnce(new Error('audit sink offline'));
+      const service = new InvitationService();
+
+      expect(await service.revokeInvitation(invite.token, 'admin-1')).toBe(true);
+      expect(mocks.writeFile).toHaveBeenCalledOnce();
+    });
+
     it('saves invitations after revocation', async () => {
       const invite = makeInvite({ token: 'to-revoke-save' });
       mocks.readFile.mockImplementation(async (path: string) => {
@@ -1075,6 +1370,17 @@ describe('tinyland-invitation', () => {
   
 
   describe('extendInvitation', () => {
+    it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 169])
+    ('rejects unsupported extension %s without saving', async (hours) => {
+      const invite = makeInvite({ token: 'duration-check' });
+      mocks.readFile.mockImplementation(async (path: string) => {
+        if (path === '/tmp/invites.json') return JSON.stringify([invite]);
+        throw new Error('not found');
+      });
+      const service = new InvitationService();
+      expect(await service.extendInvitation(invite.token, hours)).toBe(false);
+      expect(mocks.writeFile).not.toHaveBeenCalled();
+    });
     it('extends the expiry of a valid invitation', async () => {
       const invite = makeInvite({ token: 'to-extend' });
       const originalExpiry = new Date(invite.expiresAt).getTime();
@@ -1141,6 +1447,7 @@ describe('tinyland-invitation', () => {
 
     it('can extend by fractional hours', async () => {
       const invite = makeInvite({ token: 'fractional' });
+      const originalExpiry = Date.parse(invite.expiresAt);
       mocks.readFile.mockImplementation(async (path: string) => {
         if (path === '/tmp/invites.json') return JSON.stringify([invite]);
         throw new Error('not found');
@@ -1149,6 +1456,8 @@ describe('tinyland-invitation', () => {
       const service = new InvitationService();
       const result = await service.extendInvitation('fractional', 0.5);
       expect(result).toBe(true);
+      const extended = await service.getInvitation('fractional');
+      expect(Date.parse(extended!.expiresAt) - originalExpiry).toBe(30 * 60 * 1000);
     });
   });
 
@@ -1439,18 +1748,26 @@ describe('tinyland-invitation', () => {
       );
     });
 
-    it('handles missing admin users file gracefully', async () => {
-      installStatefulStorage(mocks);
+    it('fails closed when the admin users file is missing (no write, token kept)', async () => {
+      const files = installStatefulStorage(mocks);
+      files.delete('/tmp/admin-users.json');
       const service = new InvitationService();
       const created = await service.createInvitation(defaultCreateOptions);
+      const token = created.invitation!.token;
 
       const result = await service.acceptInvitation({
-        token: created.invitation!.token,
+        token,
         handle: 'nousers',
         password: 'pass',
       });
 
-      expect(result.success).toBe(true);
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(files.has('/tmp/admin-users.json')).toBe(false);
+      expect(
+        mocks.writeFile.mock.calls.filter(([path]) => path === '/tmp/admin-users.json'),
+      ).toHaveLength(0);
+      expect(mocks.hashPassword).not.toHaveBeenCalled();
+      expect(await service.getInvitation(token)).not.toBeNull();
     });
   });
 
@@ -1582,23 +1899,23 @@ describe('tinyland-invitation', () => {
       expect(pending).toHaveLength(3);
     });
 
-    it('handles the case where admin users file returns invalid JSON', async () => {
+    it('fails closed when the admin users file is invalid JSON (no write)', async () => {
       const files = installStatefulStorage(mocks);
       const service = new InvitationService();
       const created = await service.createInvitation(defaultCreateOptions);
       files.set('/tmp/admin-users.json', 'not json');
 
-      
-      
-      
       const result = await service.acceptInvitation({
         token: created.invitation!.token,
         handle: 'badjson',
         password: 'pass',
       });
 
-      
-      expect(result.success).toBe(true);
+      expect(result).toEqual({ success: false, error: 'Failed to accept invitation' });
+      expect(files.get('/tmp/admin-users.json')).toBe('not json');
+      expect(
+        mocks.writeFile.mock.calls.filter(([path]) => path === '/tmp/admin-users.json'),
+      ).toHaveLength(0);
     });
   });
 
