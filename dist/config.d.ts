@@ -20,6 +20,16 @@ export interface InvitationConfig {
     adminUsersFilePath: string;
     /** When enabled, writeFile MUST atomically replace and durably sync projections. */
     durableAcceptance?: DurableInvitationAcceptanceConfig;
+    /**
+     * Acceptance gate for the legacy (non-durable) mode. Resolve the creator's
+     * CURRENT authority; never trust the invitation's stored role. Without this
+     * hook a legacy acceptInvitation refuses and writes nothing. Durable mode
+     * uses durableAcceptance.canAcceptInvitation and does not read this field.
+     */
+    canAcceptInvitation?: (args: {
+        invitation: AdminInvite;
+        handle: string;
+    }) => boolean | Promise<boolean>;
     generateId: () => string;
     hashPassword: (password: string, rounds: number) => Promise<string>;
     generateTotpSecret: () => string;

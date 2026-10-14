@@ -1,5 +1,12 @@
 import type { InvitationConfig } from './config.js';
-import type { AcceptResult, AdminInvite, InvitationAcceptData } from './types.js';
+import type { AcceptResult, AdminInvite, AdminUser, InvitationAcceptData } from './types.js';
+/**
+ * Strictly parse the user authority. A read or parse failure is never mapped to
+ * an empty list: writing from that list would erase every existing account.
+ * Shared by the durable and legacy acceptance paths (internal, not exported
+ * from the package entry).
+ */
+export declare function parseUserProjection(raw: string): AdminUser[];
 /**
  * A narrow file-backed commit/replay coordinator, not a distributed transaction.
  * The consumer must serialize all auth mutations and run recovery before auth

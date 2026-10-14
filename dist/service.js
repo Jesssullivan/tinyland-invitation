@@ -3,7 +3,7 @@ import { getConfig } from './config.js';
 import { InvitationError } from './errors.js';
 import { defaultCanCreateInviteForRole } from './roles.js';
 import { currentDate } from './seams.js';
-import { DurableInvitationAcceptance } from './durable-acceptance.js';
+import { DurableInvitationAcceptance, parseUserProjection } from './durable-acceptance.js';
 const acceptanceLocks = new Map();
 const failedAcceptanceClaims = new Set();
 // Bounds each issuance or extension request, not the cumulative invite lifetime.
@@ -205,6 +205,14 @@ export class InvitationService {
                 return { success: false, error: 'Failed to accept invitation' };
             }
         }
+        // The legacy path never writes the user authority without a consumer
+        // decision on the creator's current authority. Refuse before any read,
+        // claim or write so a mis-wired consumer cannot mint accounts.
+        const canAccept = config.canAcceptInvitation;
+        if (!canAccept) {
+            console.error('Invitation acceptance refused: configure canAcceptInvitation (or durableAcceptance)');
+            return { success: false, error: 'Failed to accept invitation' };
+        }
         const lockKey = `${config.invitesFilePath}\0${data.token}`;
         return withAcceptanceLock(lockKey, async () => {
             await this.ensureInitialized();
@@ -223,7 +231,16 @@ export class InvitationService {
                         error: 'Invalid or expired invitation',
                     };
                 }
+                // Fails closed (throws) on a missing, unreadable or corrupt user file.
                 const existingUsers = await this.loadAdminUsers();
+                // The hook decides on the pre-claim snapshot, both times it is asked.
+                const decided = { ...invitation };
+                if (!(await canAccept({ invitation: decided, handle: data.handle }))) {
+                    return {
+                        success: false,
+                        error: 'Invalid or expired invitation',
+                    };
+                }
                 if (existingUsers.some((u) => u.handle === data.handle)) {
                     return {
                         success: false,
@@ -245,6 +262,24 @@ export class InvitationService {
                     throw error;
                 }
                 const passwordHash = await config.hashPassword(data.password, config.authConfig.password.bcryptRounds);
+                // Hashing is asynchronous. Re-read the user authority and re-ask the
+                // consumer immediately before the write, and only ever write from a
+                // successful read. Any failure here leaves the token consumed and the
+                // user file untouched. (Legacy mode has no shared mutation gate; use
+                // durableAcceptance for that.)
+                const currentUsers = await this.loadAdminUsers();
+                if (!(await canAccept({ invitation: decided, handle: data.handle }))) {
+                    return {
+                        success: false,
+                        error: 'Invalid or expired invitation',
+                    };
+                }
+                if (currentUsers.some((u) => u.handle === data.handle)) {
+                    return {
+                        success: false,
+                        error: 'Handle already taken',
+                    };
+                }
                 const newUser = {
                     id: userId,
                     username: data.handle,
@@ -261,8 +296,8 @@ export class InvitationService {
                     createdAt: currentDate().toISOString(),
                     updatedAt: currentDate().toISOString(),
                 };
-                existingUsers.push(newUser);
-                await config.writeFile(config.adminUsersFilePath, JSON.stringify(existingUsers, null, 2));
+                currentUsers.push(newUser);
+                await config.writeFile(config.adminUsersFilePath, JSON.stringify(currentUsers, null, 2));
                 await config.auditLog('INVITATION_ACCEPTED', {
                     invitationId: invitation.id,
                     userId: newUser.id,
@@ -371,15 +406,11 @@ export class InvitationService {
             targetRole,
         });
     }
+    // Fail closed: a missing, unreadable or corrupt user authority is storage
+    // loss, never an empty install. An invitation implies an existing creator.
     async loadAdminUsers() {
         const config = getConfig();
-        try {
-            const data = await config.readFile(config.adminUsersFilePath);
-            return JSON.parse(data);
-        }
-        catch {
-            return [];
-        }
+        return parseUserProjection(await config.readFile(config.adminUsersFilePath));
     }
 }
 export const invitationService = new InvitationService();
