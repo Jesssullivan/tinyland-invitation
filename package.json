@@ -32,7 +32,7 @@
   "author": "Tinyland.dev",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tinyland-inc/tinyland-invitation.git"
+    "url": "git+https://github.com/xoxd-ai/tinyland-invitation.git"
   },
   "dependencies": {},
   "devDependencies": {
@@ -45,8 +45,8 @@
     "node": ">=22.0.0"
   },
   "packageManager": "pnpm@10.13.1",
-  "homepage": "https://github.com/tinyland-inc/tinyland-invitation",
+  "homepage": "https://github.com/xoxd-ai/tinyland-invitation",
   "bugs": {
-    "url": "https://github.com/tinyland-inc/tinyland-invitation/issues"
+    "url": "https://github.com/xoxd-ai/tinyland-invitation/issues"
   }
 }

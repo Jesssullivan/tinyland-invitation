@@ -42,6 +42,9 @@ needs a consumer hook, an existing user file and canonical handles. See
   False`, no publish hooks) plus `//:package_artifact_test` on the real
   `//:pkg`. The candidate's inert GF v4 lane file and its workflow-absence
   contract test are not carried over; the inert plan documents stay.
+- Package metadata (`repository`, `homepage`, `bugs`) names the canonical
+  `xoxd-ai/tinyland-invitation`. The old `tinyland-inc` URL was only a GitHub
+  transfer redirect to it.
 
 ### Migrating from 0.3.0
 
