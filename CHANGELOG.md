@@ -11,10 +11,21 @@ invitation source the Mothership writer image already builds through
   acceptance journal), `InvitationService.recoverPendingAcceptances()` and
   `AcceptResult.replayed`. Replay never restores old user security state and
   omits user and temporary-factor material.
+- Legacy (non-durable) acceptance is gated by the consumer: `acceptInvitation`
+  requires the new optional `InvitationConfig.canAcceptInvitation` hook and,
+  without it, refuses before reading, claiming or writing anything. The hook is
+  asked before the token claim and again after password hashing, on the
+  pre-claim invitation snapshot. Durable mode keeps using
+  `durableAcceptance.canAcceptInvitation`.
+- In both modes a missing, unreadable or corrupt user file (not a JSON array,
+  an entry without `id`/`handle`, duplicate ids or case-insensitive handles)
+  fails closed. It is never read as an empty list, so no acceptance can rewrite
+  `admin-users.json` without the established accounts. Legacy mode re-reads the
+  users after hashing and writes only from that successful read.
 - Inactive invitations are excluded from pending lookup, acceptance and the
-  pending list; corrupt or missing established user authority fails closed.
-- Legacy username aliases are reserved, and committed issuance is reported
-  truthfully.
+  pending list (both modes).
+- Durable mode also reserves legacy username aliases. Committed issuance is
+  reported truthfully even if the audit sink fails (both modes).
 - The new acceptance and expiry paths read the internal `seams.ts` clock that
   0.3.0 introduced (system time unless the NODE_ENV=test testing build installs
   a clock); no public clock option is added.
@@ -22,6 +33,28 @@ invitation source the Mothership writer image already builds through
   False`, no publish hooks) plus `//:package_artifact_test` on the real
   `//:pkg`. The candidate's inert GF v4 lane file and its workflow-absence
   contract test are not carried over; the inert plan documents stay.
+
+### Migrating from 0.3.0
+
+There is no dependency, peer, engine or export change. `canAcceptInvitation`
+and `durableAcceptance` are additive optional config fields. Behavior changes
+that consumers must act on:
+
+1. **Legacy acceptance needs a hook.** If you call `acceptInvitation` without
+   `durableAcceptance`, add `canAcceptInvitation: async ({ invitation, handle })
+   => ...` that resolves the creator's current account and role policy. Without
+   it, acceptance returns `{ success: false, error: 'Failed to accept
+   invitation' }` and the token stays pending. The hook is not a mutation
+   gate. For production, prefer `durableAcceptance`, which serializes every
+   auth mutation and recovers after a crash.
+2. **The user file must exist.** Seed `admin-users.json` with `[]` (or the
+   bootstrap account) before the first acceptance. A missing or corrupt file
+   used to be treated as empty and overwritten with only the invitee; it now
+   fails the acceptance and is left untouched.
+3. **Inactive invitations** (`isActive !== true`) are no longer returned by
+   `getInvitation` or `listPendingInvitations`, and cannot be accepted.
+4. **Rollback is not state-safe after durable writes.** Before moving back to
+   0.3.0, finish recovery and keep the acceptance journal (see the README).
 
 ## 0.2.6 — unreleased launch candidate (folded into 0.4.0)
 

@@ -56,6 +56,26 @@ function invalid(): AcceptResult {
 }
 
 /**
+ * Strictly parse the user authority. A read or parse failure is never mapped to
+ * an empty list: writing from that list would erase every existing account.
+ * Shared by the durable and legacy acceptance paths (internal, not exported
+ * from the package entry).
+ */
+export function parseUserProjection(raw: string): AdminUser[] {
+  const users: unknown = JSON.parse(raw);
+  if (!Array.isArray(users) || users.some((user) =>
+    !user || typeof user.id !== 'string' || !user.id
+    || typeof user.handle !== 'string' || !user.handle)) {
+    throw new Error('Invalid user projection');
+  }
+  if (new Set(users.map((user) => user.id)).size !== users.length
+      || new Set(users.map((user) => normalizedHandle(user.handle))).size !== users.length) {
+    throw new Error('Duplicate user projection identity');
+  }
+  return users as AdminUser[];
+}
+
+/**
  * A narrow file-backed commit/replay coordinator, not a distributed transaction.
  * The consumer must serialize all auth mutations and run recovery before auth
  * decisions. Once committed, an operation is authoritative even if the invite
@@ -259,17 +279,7 @@ export class DurableInvitationAcceptance {
   private async readUsers(): Promise<AdminUser[]> {
     // An inviter already exists when accepting an invitation. Missing user
     // authority is storage loss, not permission to recreate a prior snapshot.
-    const users: unknown = JSON.parse(await this.config.readFile(this.config.adminUsersFilePath));
-    if (!Array.isArray(users) || users.some((user) =>
-      !user || typeof user.id !== 'string' || !user.id
-      || typeof user.handle !== 'string' || !user.handle)) {
-      throw new Error('Invalid user projection');
-    }
-    if (new Set(users.map((user) => user.id)).size !== users.length
-        || new Set(users.map((user) => normalizedHandle(user.handle))).size !== users.length) {
-      throw new Error('Duplicate user projection identity');
-    }
-    return users as AdminUser[];
+    return parseUserProjection(await this.config.readFile(this.config.adminUsersFilePath));
   }
 
   private async readProjection(path: string): Promise<unknown> {

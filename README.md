@@ -82,10 +82,30 @@ never recreate accounts to repair an empty projection or permit fresh bootstrap.
   not replay audit events or reissue invitation credentials.
 
 All invitation-service reads and mutations join the supplied gate when this mode
-is enabled. The legacy non-durable mode remains available for compatibility but
-does not offer this crash recovery contract. Switching back to an older package
-after accepting new writes is not a state-safe rollback: preserve journals and
-finish recovery with a compatible implementation first.
+is enabled. Switching back to an older package after accepting new writes is not
+a state-safe rollback: preserve journals and finish recovery with a compatible
+implementation first.
+
+## Legacy (non-durable) acceptance
+
+The legacy mode remains available for compatibility. It does not offer the
+crash recovery contract above, and it has no shared mutation gate. It never
+writes the user file without a consumer decision:
+
+```ts
+canAcceptInvitation: async ({ invitation, handle }) =>
+  authorizeCurrentInvitationCreator(invitation, handle),
+```
+
+- Without `canAcceptInvitation`, `acceptInvitation` refuses before reading,
+  claiming or writing anything.
+- The hook is asked before the token is claimed and again after the password
+  is hashed. A denial before the claim leaves the token pending; a later
+  denial or failure leaves it consumed and writes no user.
+- The user file is read strictly, as in durable mode. A missing, unreadable or
+  corrupt file fails the acceptance and is never rewritten. Seed it with `[]`
+  or the bootstrap account first. The new user is appended to a fresh,
+  successful read taken after hashing.
 
 ## Validation
 
@@ -96,6 +116,6 @@ rechecks. Source version/namespace and publication-retirement contracts also sta
 inside `//:test`; `//:pkg` depends on the TypeScript compilation target.
 `//:package_artifact_test` checks the actual generated package's manifest and
 declared files with locked `publint`, without repacking or importing its runtime.
-Release qualification requires exact-source remote GF-backed Bazel evidence and an
-external BCR consumer proof. Local diagnostics are not that evidence and are not
-authorized in this source-preparation pass.
+A release is qualified by exact-source `bazel test //...` evidence (both targets)
+and an independent review before merge. Pull-request CI also runs, and any
+post-merge failure is fixed forward.
