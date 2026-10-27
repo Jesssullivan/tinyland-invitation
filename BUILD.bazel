@@ -3,7 +3,8 @@ BUILD.bazel for @tummycrypt/tinyland-invitation.
 
 Dual-mode build: works with both pnpm (standalone) and Bazel (CI/production).
   Standalone: pnpm build && pnpm test
-  Bazel:      CI (.github/workflows/ci.yml) builds //:pkg and tests //:test.
+  Bazel:      CI (.github/workflows/ci.yml) builds //:pkg and //:test.
+              It does not run `bazel test`.
               A local `bazel test //...` is local, non-qualifying.
 """
 

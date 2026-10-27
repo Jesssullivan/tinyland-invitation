@@ -17,7 +17,7 @@ build:ci --curses=no
 build:ci --noshow_loading_progress
 test:ci --test_output=errors
 
-# With a remote cache or executor, a failed remote action fails the build
+# With a remote executor, a failed remote action fails the build
 # instead of rerunning locally.
 build --remote_local_fallback=false
 
